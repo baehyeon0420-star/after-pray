@@ -1,0 +1,11 @@
+# 빌드 결과물 (CubeIDE가 빌드할 때 다시 만듦)
+Debug/
+Release/
+
+# 개인 실행 설정 (PC마다 경로가 다름)
+*.launch
+
+# macOS / Windows 부산물
+.DS_Store
+__MACOSX/
+Thumbs.db
