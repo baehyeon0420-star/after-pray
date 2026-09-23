@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "soc.h"
+#include "bms_display.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -160,9 +161,11 @@ static void bms_handle_command(uint8_t c)
     case 'c': manual_mode = 1; manual_I_A = -1.50f; break;
     case 'i': manual_mode = 1; manual_I_A =  0.00f; break;
     case '+': manual_mode = 1; manual_V_V += 0.10f;
-              if (manual_V_V > 4.30f) manual_V_V = 4.30f; break;
+              if (manual_V_V > 4.30f) manual_V_V = 4.30f;
+              break;
     case '-': manual_mode = 1; manual_V_V -= 0.10f;
-              if (manual_V_V < 2.00f) manual_V_V = 2.00f; break;
+              if (manual_V_V < 2.00f) manual_V_V = 2.00f;
+              break;
     case 'a': manual_mode = 0; break;
     case 'r': soc_valid = 0; bms_soc.soc_percent = 0.0f; break;
     case 'h': printf("[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정\r\n"); return;
@@ -192,9 +195,11 @@ static void bms_task_100ms(void)
   /* J: 재동기 */
   bms_resync(V, I_A);
 
-  /* M: 5회마다(0.5초) 출력. 나중에 OLED로 교체 */
+  /* M: 5회마다(0.5초) 출력. OLED가 있으면 화면에도 그림 */
   if (tick_count % 5 == 0) {
     int v_mv = (int)(V * 1000.0f + 0.5f);
+    float T_C = 25.0f;                       /* NTC 오기 전까지 더미 온도 */
+    bms_display_update(V, I_A, T_C, soc_valid, bms_soc.soc_percent, bms_state_name(bms_state));
     if (soc_valid) {
       int soc_x100 = (int)(bms_soc.soc_percent * 100.0f + 0.5f);
       printf("t=%lus V=%dmV I=%dmA %s SOC: %d.%02d %%\r\n",
@@ -244,6 +249,7 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_buf, 1);   // 키 입력 받기 시작
+  printf("\r\nOLED: %s\r\n", bms_display_init() ? "found" : "not found (UART only)");
     printf("\r\n[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정 h=도움말\r\n");
   SOC_Init(&bms_soc, 100.0f, 3000.0f);   // 시작 SOC 100%, 용량 3000 mAh (30Q)
   SOC_CalibrateOffset(&bms_soc, 0.0f);   // Zero-Current Offset, 실측 전까지 0
@@ -379,7 +385,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = 400000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
