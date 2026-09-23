@@ -79,8 +79,8 @@ flowchart TD
 
 - [x] TIM2 10 Hz 인터럽트
 - [x] SOC 모듈(soc.c) 연동, 더미 전류로 보드 검증 (0.84 A 기준 감소율 이론값과 일치)
-- [ ] 상태 판정 (DISCHARGING / CHARGING / IDLE)
-- [ ] SOC 유효 여부, 재동기 (만충 100% / 저전압 0%)
+- [x] 상태 판정 (DISCHARGING / CHARGING / IDLE)
+- [x] SOC 유효 여부, 재동기 (만충 100% / 저전압 0%) — 보드에서 두 경우 모두 확인
 - [ ] OLED 드라이버 (afiskon/stm32-ssd1306), I2C1 400 kHz로 변경
 - [ ] INA228 / NTC 실측값으로 더미 교체
 - [ ] Fault 검사 (S5)
