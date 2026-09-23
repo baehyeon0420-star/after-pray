@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include "soc.h"
 #include "bms_display.h"
+#include "bms_sensors.h"
+#include "bms_io.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,9 +65,6 @@ UART_HandleTypeDef huart2;
 volatile uint8_t rx_buf = 0;       // HAL이 채우는 자리
 volatile uint8_t rx_cmd = 0;       // 처리할 글자
 volatile uint8_t rx_new = 0;       // 새 글자 도착 표시
-uint8_t manual_mode = 0;           // 1이면 키 입력으로 전압·전류 지정
-float   manual_I_A = 0.0f;
-float   manual_V_V = 3.70f;
 SOC_Module bms_soc;                // SOC 계산 모듈 (soc.c)
 volatile uint8_t tick_100ms = 0;
 uint32_t tick_count = 0;
@@ -91,26 +90,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM2) {
     tick_100ms = 1;
   }
-}
-
-/* 더미 전류: 60초 시나리오 (흐름도 규약: 방전 +, 충전 -) */
-static float dummy_current_A(uint32_t tick)
-{
-  uint32_t t = (tick / 10) % 60;
-  if (t < 15) return 0.84f;              // 0~14초 방전
-  if (t < 30) return 0.0f;               // 15~29초 대기
-  if (t < 45) return -1.5f;              // 30~44초 충전
-  return 0.0f;                           // 45~59초 충전 끝난 뒤 대기
-}
-
-/* 더미 전압: 위 시나리오에 맞춰 방전 끝과 충전 끝을 만들어 줌 */
-static float dummy_voltage_V(uint32_t tick)
-{
-  uint32_t t = (tick / 10) % 60;
-  if (t < 15) return 3.70f - (t * 0.09f);        // 3.70 V -> 2.44 V (저전압 도달)
-  if (t < 30) return 3.00f;                      // 대기
-  if (t < 45) return 3.00f + ((t - 30) * 0.08f); // 3.00 V -> 4.12 V (아직 만충 아님)
-  return 4.18f;                                  // 전류 0에서 만충 조건 성립
 }
 
 /* S: 상태 판정. 전류 크기가 임계값 이하면 IDLE */
@@ -157,22 +136,20 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 static void bms_handle_command(uint8_t c)
 {
   switch (c) {
-    case 'd': manual_mode = 1; manual_I_A =  0.84f; break;
-    case 'c': manual_mode = 1; manual_I_A = -1.50f; break;
-    case 'i': manual_mode = 1; manual_I_A =  0.00f; break;
-    case '+': manual_mode = 1; manual_V_V += 0.10f;
-              if (manual_V_V > 4.30f) manual_V_V = 4.30f;
-              break;
-    case '-': manual_mode = 1; manual_V_V -= 0.10f;
-              if (manual_V_V < 2.00f) manual_V_V = 2.00f;
-              break;
-    case 'a': manual_mode = 0; break;
+    case 'd': bms_sensors_dummy_set_current( 0.84f); break;
+    case 'c': bms_sensors_dummy_set_current(-1.50f); break;
+    case 'i': bms_sensors_dummy_set_current( 0.00f); break;
+    case '+': bms_sensors_dummy_adjust_voltage(+0.10f); break;
+    case '-': bms_sensors_dummy_adjust_voltage(-0.10f); break;
+    case 'a': bms_sensors_dummy_manual(0); break;
     case 'r': soc_valid = 0; bms_soc.soc_percent = 0.0f; break;
     case 'h': printf("[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정\r\n"); return;
     default:  return;
   }
-  printf("[입력 %c] 모드=%s V=%dmV I=%dmA\r\n", c, manual_mode ? "수동" : "자동",
-         (int)(manual_V_V * 1000.0f), (int)(manual_I_A * 1000.0f));
+  printf("[입력 %c] 모드=%s V=%dmV I=%dmA\r\n", c,
+         bms_sensors_dummy_is_manual() ? "수동" : "자동",
+         (int)(bms_sensors_read_voltage_V() * 1000.0f),
+         (int)(bms_sensors_read_current_A() * 1000.0f));
 }
 static void bms_task_100ms(void)
 {
@@ -180,9 +157,10 @@ static void bms_task_100ms(void)
   /* PC에서 키를 눌렀으면 처리 */
     if (rx_new) { rx_new = 0; bms_handle_command(rx_cmd); }
 
-  /* G: 전압, 전류 읽기 (소자 오기 전까지 더미값) */
-    float I_A = manual_mode ? manual_I_A : dummy_current_A(tick_count);
-    float V   = manual_mode ? manual_V_V : dummy_voltage_V(tick_count);
+  /* G: 전압, 전류, 온도 읽기 (bms_sensors.h 인터페이스. 지금은 더미 구현) */
+  float I_A = bms_sensors_read_current_A();
+  float V   = bms_sensors_read_voltage_V();
+  float T_C = bms_sensors_read_temp_C(0);
 
   /* S: 상태 판정 */
   bms_state = bms_decide_state(I_A);
@@ -198,7 +176,6 @@ static void bms_task_100ms(void)
   /* M: 5회마다(0.5초) 출력. OLED가 있으면 화면에도 그림 */
   if (tick_count % 5 == 0) {
     int v_mv = (int)(V * 1000.0f + 0.5f);
-    float T_C = 25.0f;                       /* NTC 오기 전까지 더미 온도 */
     bms_display_update(V, I_A, T_C, soc_valid, bms_soc.soc_percent, bms_state_name(bms_state));
     if (soc_valid) {
       int soc_x100 = (int)(bms_soc.soc_percent * 100.0f + 0.5f);
@@ -248,6 +225,8 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  bms_io_init();                                          // 충전·방전·DCIR 모두 차단 상태로 시작
+  bms_sensors_init();
   HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_buf, 1);   // 키 입력 받기 시작
   printf("\r\nOLED: %s\r\n", bms_display_init() ? "found" : "not found (UART only)");
     printf("\r\n[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정 h=도움말\r\n");

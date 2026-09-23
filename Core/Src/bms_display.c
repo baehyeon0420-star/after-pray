@@ -46,12 +46,13 @@ void bms_display_update(float V, float I_A, float T_C,
   int v_mv  = (int)(V * 1000.0f + 0.5f);
   int i_ma  = (int)(I_A * 1000.0f + (I_A >= 0 ? 0.5f : -0.5f));
   int t_x10 = (int)(T_C * 10.0f + 0.5f);
+  int t_frac = (t_x10 < 0 ? -t_x10 : t_x10) % 10;   /* 음수 온도에서도 소수 자리가 양수로 */
 
   ssd1306_Fill(Black);
 
   /* 1줄: 전압, 온도 */
   snprintf(line, sizeof line, "V %d.%03dV  T %d.%dC",
-           v_mv / 1000, v_mv % 1000, t_x10 / 10, t_x10 % 10);
+           v_mv / 1000, v_mv % 1000, t_x10 / 10, t_frac);
   ssd1306_SetCursor(0, 0);
   ssd1306_WriteString(line, Font_7x10, White);
 
