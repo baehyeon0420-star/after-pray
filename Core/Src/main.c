@@ -59,6 +59,12 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+volatile uint8_t rx_buf = 0;       // HAL이 채우는 자리
+volatile uint8_t rx_cmd = 0;       // 처리할 글자
+volatile uint8_t rx_new = 0;       // 새 글자 도착 표시
+uint8_t manual_mode = 0;           // 1이면 키 입력으로 전압·전류 지정
+float   manual_I_A = 0.0f;
+float   manual_V_V = 3.70f;
 SOC_Module bms_soc;                // SOC 계산 모듈 (soc.c)
 volatile uint8_t tick_100ms = 0;
 uint32_t tick_count = 0;
@@ -136,14 +142,44 @@ static void bms_resync(float V, float I_A)
     soc_valid = 1;
   }
 }
+/* UART로 한 글자 받을 때마다 자동 호출 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2) {
+    rx_cmd = rx_buf;
+    rx_new = 1;
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_buf, 1);   // 다음 글자 준비
+  }
+}
 
+/* 키 입력 처리. 수동 모드에서는 시나리오 대신 지정한 값을 사용 */
+static void bms_handle_command(uint8_t c)
+{
+  switch (c) {
+    case 'd': manual_mode = 1; manual_I_A =  0.84f; break;
+    case 'c': manual_mode = 1; manual_I_A = -1.50f; break;
+    case 'i': manual_mode = 1; manual_I_A =  0.00f; break;
+    case '+': manual_mode = 1; manual_V_V += 0.10f;
+              if (manual_V_V > 4.30f) manual_V_V = 4.30f; break;
+    case '-': manual_mode = 1; manual_V_V -= 0.10f;
+              if (manual_V_V < 2.00f) manual_V_V = 2.00f; break;
+    case 'a': manual_mode = 0; break;
+    case 'r': soc_valid = 0; bms_soc.soc_percent = 0.0f; break;
+    case 'h': printf("[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정\r\n"); return;
+    default:  return;
+  }
+  printf("[입력 %c] 모드=%s V=%dmV I=%dmA\r\n", c, manual_mode ? "수동" : "자동",
+         (int)(manual_V_V * 1000.0f), (int)(manual_I_A * 1000.0f));
+}
 static void bms_task_100ms(void)
 {
   tick_count++;
+  /* PC에서 키를 눌렀으면 처리 */
+    if (rx_new) { rx_new = 0; bms_handle_command(rx_cmd); }
 
   /* G: 전압, 전류 읽기 (소자 오기 전까지 더미값) */
-  float I_A = dummy_current_A(tick_count);
-  float V   = dummy_voltage_V(tick_count);
+    float I_A = manual_mode ? manual_I_A : dummy_current_A(tick_count);
+    float V   = manual_mode ? manual_V_V : dummy_voltage_V(tick_count);
 
   /* S: 상태 판정 */
   bms_state = bms_decide_state(I_A);
@@ -207,6 +243,8 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_buf, 1);   // 키 입력 받기 시작
+    printf("\r\n[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정 h=도움말\r\n");
   SOC_Init(&bms_soc, 100.0f, 3000.0f);   // 시작 SOC 100%, 용량 3000 mAh (30Q)
   SOC_CalibrateOffset(&bms_soc, 0.0f);   // Zero-Current Offset, 실측 전까지 0
   HAL_TIM_Base_Start_IT(&htim2);
