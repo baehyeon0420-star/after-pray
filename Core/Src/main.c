@@ -27,13 +27,21 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum {
+  BMS_IDLE = 0,
+  BMS_CHARGING,
+  BMS_DISCHARGING
+} bms_state_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define INA228_ADDR 0x40
 #define REG_VBUS    0x05
+#define I_IDLE_THRESHOLD_A  0.05f  // 전류 크기가 50 mA 이하면 IDLE (임시값)
+#define V_FULL_THRESHOLD_V   4.15f  // 만충 판정 전압 (임시값)
+#define I_FULL_TERMINATE_A   0.10f  // 충전 종료 전류 (임시값, TP5000 확인 필요)
+#define V_EMPTY_THRESHOLD_V  2.50f  // 저전압 임계 (임시값, BQ29700 확인 필요)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,6 +62,8 @@ UART_HandleTypeDef huart2;
 SOC_Module bms_soc;                // SOC 계산 모듈 (soc.c)
 volatile uint8_t tick_100ms = 0;
 uint32_t tick_count = 0;
+bms_state_t bms_state = BMS_IDLE;  // 현재 배터리 상태
+uint8_t soc_valid = 0;             // 0이면 SOC 미정 (흐름도의 "SOC 유효?")
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,20 +86,89 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
+/* 더미 전류: 60초 시나리오 (흐름도 규약: 방전 +, 충전 -) */
+static float dummy_current_A(uint32_t tick)
+{
+  uint32_t t = (tick / 10) % 60;
+  if (t < 15) return 0.84f;              // 0~14초 방전
+  if (t < 30) return 0.0f;               // 15~29초 대기
+  if (t < 45) return -1.5f;              // 30~44초 충전
+  return 0.0f;                           // 45~59초 충전 끝난 뒤 대기
+}
+
+/* 더미 전압: 위 시나리오에 맞춰 방전 끝과 충전 끝을 만들어 줌 */
+static float dummy_voltage_V(uint32_t tick)
+{
+  uint32_t t = (tick / 10) % 60;
+  if (t < 15) return 3.70f - (t * 0.09f);        // 3.70 V -> 2.44 V (저전압 도달)
+  if (t < 30) return 3.00f;                      // 대기
+  if (t < 45) return 3.00f + ((t - 30) * 0.08f); // 3.00 V -> 4.12 V (아직 만충 아님)
+  return 4.18f;                                  // 전류 0에서 만충 조건 성립
+}
+
+/* S: 상태 판정. 전류 크기가 임계값 이하면 IDLE */
+static bms_state_t bms_decide_state(float I_A)
+{
+  if (I_A >  I_IDLE_THRESHOLD_A) return BMS_DISCHARGING;
+  if (I_A < -I_IDLE_THRESHOLD_A) return BMS_CHARGING;
+  return BMS_IDLE;
+}
+
+static const char *bms_state_name(bms_state_t s)
+{
+  switch (s) {
+    case BMS_DISCHARGING: return "DISCHARGING";
+    case BMS_CHARGING:    return "CHARGING";
+    default:              return "IDLE";
+  }
+}
+
+/* J: 재동기. 확실히 아는 순간에 SOC를 강제로 맞추고 유효 표시 */
+static void bms_resync(float V, float I_A)
+{
+  float I_abs = (I_A < 0.0f) ? -I_A : I_A;
+
+  if (V >= V_FULL_THRESHOLD_V && I_abs <= I_FULL_TERMINATE_A) {
+    bms_soc.soc_percent = 100.0f;      // 만충
+    soc_valid = 1;
+  } else if (bms_state == BMS_DISCHARGING && V <= V_EMPTY_THRESHOLD_V) {
+    bms_soc.soc_percent = 0.0f;        // 완전 방전
+    soc_valid = 1;
+  }
+}
+
 static void bms_task_100ms(void)
 {
-  /* G: 전류 읽기 (INA228 오기 전까지 더미값. 흐름도 규약: 방전 +, 충전 -) */
-  float I_A = 0.84f;                                  // 0.84 A 방전 중이라고 가정
+  tick_count++;
 
-  /* H~I2: 전하 적산 -> SOC 계산 -> 0~100% 제한 (soc.c) */
-  /* soc.c는 충전 +, 방전 - 규약이라 부호를 뒤집어 전달 */
-  float soc = SOC_Update(&bms_soc, -I_A, 0.1f);
+  /* G: 전압, 전류 읽기 (소자 오기 전까지 더미값) */
+  float I_A = dummy_current_A(tick_count);
+  float V   = dummy_voltage_V(tick_count);
+
+  /* S: 상태 판정 */
+  bms_state = bms_decide_state(I_A);
+
+  /* VC + H~I2: SOC가 유효할 때만 적산하고 계산 */
+  if (soc_valid) {
+    SOC_Update(&bms_soc, -I_A, 0.1f);
+  }
+
+  /* J: 재동기 */
+  bms_resync(V, I_A);
 
   /* M: 5회마다(0.5초) 출력. 나중에 OLED로 교체 */
-  tick_count++;
   if (tick_count % 5 == 0) {
-    int soc_x100 = (int)(soc * 100.0f + 0.5f);        // %f 미지원이라 정수로 출력
-    printf("SOC: %d.%02d %%\r\n", soc_x100 / 100, soc_x100 % 100);
+    int v_mv = (int)(V * 1000.0f + 0.5f);
+    if (soc_valid) {
+      int soc_x100 = (int)(bms_soc.soc_percent * 100.0f + 0.5f);
+      printf("t=%lus V=%dmV I=%dmA %s SOC: %d.%02d %%\r\n",
+             tick_count / 10, v_mv, (int)(I_A * 1000.0f),
+             bms_state_name(bms_state), soc_x100 / 100, soc_x100 % 100);
+    } else {
+      printf("t=%lus V=%dmV I=%dmA %s SOC: --\r\n",
+             tick_count / 10, v_mv, (int)(I_A * 1000.0f),
+             bms_state_name(bms_state));
+    }
   }
 }
 /* USER CODE END 0 */
