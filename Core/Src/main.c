@@ -76,9 +76,9 @@ uint8_t soc_valid = 0;             // 0이면 SOC 미정 (흐름도의 "SOC 유�
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -132,6 +132,77 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   }
 }
 
+/* I2C 버스 스캔: 어떤 주소가 응답하는지 확인 (배선/주소 점검용) */
+static void bms_i2c_scan(void)
+{
+  uint8_t found = 0;
+  printf("[I2C scan] SCL=PB8 SDA=PB9, 7bit addr 0x03~0x77\r\n");
+  for (uint8_t a = 0x03; a <= 0x77; a++) {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(a << 1), 2, 5) == HAL_OK) {
+      printf("  응답: 0x%02X\r\n", a);
+      found++;
+    }
+  }
+  if (found == 0) {
+    printf("  응답 없음. 배선(SCL/SDA 바뀜, GND, VCC) 확인 필요\r\n");
+  } else {
+    printf("  총 %d개 (OLED=0x3C 또는 0x3D, INA228=0x40)\r\n", found);
+  }
+}
+
+/* I2C 선 상태 점검: SCL/SDA가 High로 떠 있는지(풀업·전원 확인) */
+static void bms_i2c_pincheck(void)
+{
+  GPIO_InitTypeDef g = {0};
+  HAL_I2C_DeInit(&hi2c1);                       /* 핀을 일반 입력으로 되돌리기 */
+
+  g.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+  g.Mode = GPIO_MODE_INPUT;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+
+  g.Pull = GPIO_NOPULL;                         /* 외부 풀업만으로 High인지 */
+  HAL_GPIO_Init(GPIOB, &g);
+  HAL_Delay(2);
+  int scl_ext = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8);
+  int sda_ext = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+
+  g.Pull = GPIO_PULLDOWN;                       /* 내부 풀다운으로 눌러도 High면 강한 외부 풀업 */
+  HAL_GPIO_Init(GPIOB, &g);
+  HAL_Delay(2);
+  int scl_pd = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8);
+  int sda_pd = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+
+  printf("[핀 점검] 외부풀업만: SCL=%d SDA=%d / 내부풀다운: SCL=%d SDA=%d\r\n",
+         scl_ext, sda_ext, scl_pd, sda_pd);
+  if (scl_ext == 0 && sda_ext == 0) {
+    printf("  둘 다 Low -> 모듈 전원이 없거나 선이 닿지 않음 (또는 GND 단락)\r\n");
+  } else if (scl_pd == 1 && sda_pd == 1) {
+    printf("  외부 풀업 있음 -> 배선·전원 정상. 주소나 모듈 쪽 문제\r\n");
+  } else {
+    printf("  풀업이 약함 -> 'u'로 내부 풀업 켜고 100 kHz로 재시도해 보세요\r\n");
+  }
+
+  MX_I2C1_Init();                               /* I2C 원복 */
+}
+
+/* 내부 풀업을 켜고 100 kHz로 낮춰서 I2C 재설정 (외부 풀업이 없을 때 시험용) */
+static void bms_i2c_internal_pullup(void)
+{
+  GPIO_InitTypeDef g = {0};
+  HAL_I2C_DeInit(&hi2c1);
+  hi2c1.Init.ClockSpeed = 100000;
+  HAL_I2C_Init(&hi2c1);
+
+  g.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+  g.Mode = GPIO_MODE_AF_OD;
+  g.Pull = GPIO_PULLUP;                         /* 내부 풀업 (약 40k) */
+  g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  g.Alternate = GPIO_AF4_I2C1;
+  HAL_GPIO_Init(GPIOB, &g);
+
+  printf("[I2C] 내부 풀업 ON, 100 kHz로 변경\r\n");
+}
+
 /* 키 입력 처리. 수동 모드에서는 시나리오 대신 지정한 값을 사용 */
 static void bms_handle_command(uint8_t c)
 {
@@ -143,7 +214,11 @@ static void bms_handle_command(uint8_t c)
     case '-': bms_sensors_dummy_adjust_voltage(-0.10f); break;
     case 'a': bms_sensors_dummy_manual(0); break;
     case 'r': soc_valid = 0; bms_soc.soc_percent = 0.0f; break;
-    case 'h': printf("[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정\r\n"); return;
+    case 's': bms_i2c_scan(); return;
+    case 'p': bms_i2c_pincheck(); return;
+    case 'u': bms_i2c_internal_pullup(); bms_i2c_scan(); return;
+    case 'o': printf("[OLED] 재검색: %s\r\n", bms_display_init() ? "found" : "not found"); return;
+    case 'h': printf("[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정 s=I2C스캔 p=핀점검 u=내부풀업 o=OLED재검색\r\n"); return;
     default:  return;
   }
   printf("[입력 %c] 모드=%s V=%dmV I=%dmA\r\n", c,
@@ -221,15 +296,15 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
-  MX_I2C1_Init();
   MX_USART2_UART_Init();
   MX_TIM2_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   bms_io_init();                                          // 충전·방전·DCIR 모두 차단 상태로 시작
   bms_sensors_init();
   HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_buf, 1);   // 키 입력 받기 시작
   printf("\r\nOLED: %s\r\n", bms_display_init() ? "found" : "not found (UART only)");
-    printf("\r\n[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정 h=도움말\r\n");
+    printf("\r\n[명령] d=방전 c=충전 i=대기 +/-=전압조절 a=자동 r=SOC미정 s=I2C스캔 p=핀점검 u=내부풀업 o=OLED재검색 h=도움말\r\n");
   SOC_Init(&bms_soc, 100.0f, 3000.0f);   // 시작 SOC 100%, 용량 3000 mAh (30Q)
   SOC_CalibrateOffset(&bms_soc, 0.0f);   // Zero-Current Offset, 실측 전까지 0
   HAL_TIM_Base_Start_IT(&htim2);
